@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"log"
 	"mime/multipart"
@@ -16,22 +16,24 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/mcstatus-io/mcutil/v4/response"
+	"github.com/mcstatus-io/mcutil/v4/status"
 )
 
 type config struct {
 	host              string
-	port              string
+	port              uint16
 	pollInterval      time.Duration
 	requestTimeout    time.Duration
 	runOnce           bool
 	notifyOnStart     bool
+	serverEdition     string
+	allowLegacyStatus bool
 	telegramToken     string
 	telegramChatID    string
 	telegramParseMode string
 	telegramUsePhoto  bool
 	disableWebPreview bool
-	statusAPIEnabled  bool
-	statusAPIBase     string
 	includeMotd       bool
 	includePlayers    bool
 	includeVersion    bool
@@ -41,17 +43,19 @@ type config struct {
 	closedText        string
 }
 
-type mcStatus struct {
-	Online  bool   `json:"online"`
-	Version string `json:"version"`
-	Icon    string `json:"icon"`
-	Motd    struct {
-		Clean []string `json:"clean"`
-	} `json:"motd"`
-	Players struct {
-		Online int `json:"online"`
-		Max    int `json:"max"`
-	} `json:"players"`
+type serverStatus struct {
+	kind          string
+	version       string
+	protocol      string
+	motd          string
+	playersOnline *int64
+	playersMax    *int64
+	samplePlayers []string
+	latency       *time.Duration
+	modsCount     *int
+	gamemode      string
+	serverID      string
+	iconData      string
 }
 
 func main() {
@@ -62,22 +66,17 @@ func main() {
 		log.Fatal(err)
 	}
 
-	address := net.JoinHostPort(cfg.host, cfg.port)
+	address := net.JoinHostPort(cfg.host, strconv.Itoa(int(cfg.port)))
 	log.Printf("monitoring %s", address)
 
 	lastStatus := -1
 	for {
-		status, statusOK, statusErr := fetchStatus(cfg, address)
+		status, statusOK, statusErr := fetchMinecraftStatus(cfg)
 		if statusErr != nil {
-			log.Printf("status api error: %v", statusErr)
+			log.Printf("status error: %v", statusErr)
 		}
 
-		isOpen := false
-		if statusOK {
-			isOpen = status.Online
-		} else {
-			isOpen = checkOpen(address, cfg.requestTimeout)
-		}
+		isOpen := statusOK
 
 		if lastStatus == -1 {
 			log.Printf("initial status: %s", statusLabel(isOpen))
@@ -111,10 +110,16 @@ func loadConfig() (config, error) {
 	cfg := config{}
 
 	cfg.host = strings.TrimSpace(os.Getenv("SERVER_HOST"))
-	cfg.port = strings.TrimSpace(os.Getenv("SERVER_PORT"))
-	if cfg.host == "" || cfg.port == "" {
+	portRaw := strings.TrimSpace(os.Getenv("SERVER_PORT"))
+	if cfg.host == "" || portRaw == "" {
 		return cfg, fmt.Errorf("SERVER_HOST and SERVER_PORT are required")
 	}
+
+	port, err := parsePort(portRaw)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.port = port
 
 	pollSec := getEnvInt("POLL_INTERVAL_SEC", 30)
 	if pollSec < 1 {
@@ -131,6 +136,15 @@ func loadConfig() (config, error) {
 	cfg.runOnce = getEnvBool("RUN_ONCE", false)
 	cfg.notifyOnStart = getEnvBool("NOTIFY_ON_START", false)
 
+	cfg.serverEdition = strings.ToLower(strings.TrimSpace(os.Getenv("SERVER_EDITION")))
+	if cfg.serverEdition == "" {
+		cfg.serverEdition = "java"
+	}
+	if cfg.serverEdition != "java" && cfg.serverEdition != "bedrock" {
+		return cfg, fmt.Errorf("SERVER_EDITION must be java or bedrock")
+	}
+	cfg.allowLegacyStatus = getEnvBool("ALLOW_LEGACY_STATUS", true)
+
 	cfg.telegramToken = strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
 	cfg.telegramChatID = strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID"))
 	if cfg.telegramToken == "" || cfg.telegramChatID == "" {
@@ -143,11 +157,6 @@ func loadConfig() (config, error) {
 	cfg.telegramUsePhoto = getEnvBool("TELEGRAM_USE_PHOTO", true)
 	cfg.disableWebPreview = getEnvBool("DISABLE_WEB_PREVIEW", true)
 
-	cfg.statusAPIEnabled = getEnvBool("STATUS_API_ENABLED", true)
-	cfg.statusAPIBase = strings.TrimSpace(os.Getenv("STATUS_API_BASE"))
-	if cfg.statusAPIBase == "" {
-		cfg.statusAPIBase = "https://api.mcsrvstat.us/2"
-	}
 	cfg.includeMotd = getEnvBool("INCLUDE_MOTD", true)
 	cfg.includePlayers = getEnvBool("INCLUDE_PLAYERS", true)
 	cfg.includeVersion = getEnvBool("INCLUDE_VERSION", true)
@@ -196,45 +205,130 @@ func getEnvBool(key string, fallback bool) bool {
 	}
 }
 
-func checkOpen(address string, timeout time.Duration) bool {
-	conn, err := net.DialTimeout("tcp", address, timeout)
-	if err != nil {
-		return false
+func parsePort(value string) (uint16, error) {
+	port, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("SERVER_PORT must be between 1 and 65535")
 	}
-	_ = conn.Close()
-	return true
+	return uint16(port), nil
 }
 
-func fetchStatus(cfg config, address string) (mcStatus, bool, error) {
-	if !cfg.statusAPIEnabled {
-		return mcStatus{}, false, nil
-	}
-	base := strings.TrimRight(cfg.statusAPIBase, "/")
-	endpoint := fmt.Sprintf("%s/%s", base, address)
+func fetchMinecraftStatus(cfg config) (serverStatus, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.requestTimeout)
+	defer cancel()
 
-	client := &http.Client{Timeout: cfg.requestTimeout}
-	resp, err := client.Get(endpoint)
-	if err != nil {
-		return mcStatus{}, false, err
+	switch cfg.serverEdition {
+	case "java":
+		return fetchJavaStatus(ctx, cfg)
+	case "bedrock":
+		return fetchBedrockStatus(ctx, cfg)
+	default:
+		return serverStatus{}, false, fmt.Errorf("SERVER_EDITION must be java or bedrock")
 	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return mcStatus{}, false, fmt.Errorf("status api status: %s", resp.Status)
-	}
-
-	var status mcStatus
-	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-		return mcStatus{}, false, err
-	}
-	return status, true, nil
 }
 
-func sendTelegramNotification(cfg config, message string, statusOK bool, status mcStatus) error {
+func fetchJavaStatus(ctx context.Context, cfg config) (serverStatus, bool, error) {
+	modern, err := status.Modern(ctx, cfg.host, cfg.port)
+	if err == nil {
+		return mapModernStatus(modern), true, nil
+	}
+	if !cfg.allowLegacyStatus {
+		return serverStatus{}, false, err
+	}
+	legacy, legacyErr := status.Legacy(ctx, cfg.host, cfg.port)
+	if legacyErr == nil {
+		return mapLegacyStatus(legacy), true, nil
+	}
+	return serverStatus{}, false, fmt.Errorf("modern status error: %v; legacy status error: %v", err, legacyErr)
+}
+
+func fetchBedrockStatus(ctx context.Context, cfg config) (serverStatus, bool, error) {
+	bedrock, err := status.Bedrock(ctx, cfg.host, cfg.port)
+	if err != nil {
+		return serverStatus{}, false, err
+	}
+	return mapBedrockStatus(bedrock), true, nil
+}
+
+func mapModernStatus(modern *response.StatusModern) serverStatus {
+	result := serverStatus{
+		kind:          "Java (modern)",
+		version:       modern.Version.Name.Clean,
+		protocol:      fmt.Sprintf("%d", modern.Version.Protocol),
+		motd:          modern.MOTD.Clean,
+		playersOnline: modern.Players.Online,
+		playersMax:    modern.Players.Max,
+	}
+	latency := modern.Latency
+	result.latency = &latency
+	if modern.Favicon != nil {
+		result.iconData = *modern.Favicon
+	}
+	if modern.Mods != nil {
+		count := len(modern.Mods.List)
+		result.modsCount = &count
+	}
+	if len(modern.Players.Sample) > 0 {
+		for _, sample := range modern.Players.Sample {
+			name := strings.TrimSpace(sample.Name.Clean)
+			if name != "" {
+				result.samplePlayers = append(result.samplePlayers, name)
+			}
+		}
+	}
+	return result
+}
+
+func mapLegacyStatus(legacy *response.StatusLegacy) serverStatus {
+	result := serverStatus{
+		kind: "Java (legacy)",
+		motd: legacy.MOTD.Clean,
+	}
+	if legacy.Version != nil {
+		result.version = legacy.Version.Name.Clean
+		result.protocol = fmt.Sprintf("%d", legacy.Version.Protocol)
+	}
+	online := legacy.Players.Online
+	max := legacy.Players.Max
+	result.playersOnline = &online
+	result.playersMax = &max
+	return result
+}
+
+func mapBedrockStatus(bedrock *response.StatusBedrock) serverStatus {
+	result := serverStatus{
+		kind: "Bedrock",
+	}
+	if bedrock.Edition != nil && *bedrock.Edition != "" {
+		result.kind = fmt.Sprintf("Bedrock (%s)", *bedrock.Edition)
+	}
+	if bedrock.MOTD != nil {
+		result.motd = bedrock.MOTD.Clean
+	}
+	if bedrock.Version != nil {
+		result.version = *bedrock.Version
+	}
+	if bedrock.ProtocolVersion != nil {
+		result.protocol = fmt.Sprintf("%d", *bedrock.ProtocolVersion)
+	}
+	if bedrock.OnlinePlayers != nil {
+		result.playersOnline = bedrock.OnlinePlayers
+	}
+	if bedrock.MaxPlayers != nil {
+		result.playersMax = bedrock.MaxPlayers
+	}
+	if bedrock.Gamemode != nil {
+		result.gamemode = *bedrock.Gamemode
+	}
+	if bedrock.ServerID != nil {
+		result.serverID = *bedrock.ServerID
+	}
+	return result
+}
+
+func sendTelegramNotification(cfg config, message string, statusOK bool, status serverStatus) error {
 	if cfg.telegramUsePhoto && statusOK {
-		if iconBytes, ok := decodeIcon(status.Icon); ok {
+		if iconBytes, ok := decodeIcon(status.iconData); ok {
 			return sendTelegramPhoto(cfg, message, iconBytes)
 		}
 	}
@@ -329,7 +423,7 @@ func decodeIcon(icon string) ([]byte, bool) {
 	return raw, true
 }
 
-func buildMessage(cfg config, address string, isOpen bool, statusOK bool, status mcStatus) string {
+func buildMessage(cfg config, address string, isOpen bool, statusOK bool, status serverStatus) string {
 	statusText := cfg.closedText
 	if isOpen {
 		statusText = cfg.openText
@@ -345,15 +439,35 @@ func buildMessage(cfg config, address string, isOpen bool, statusOK bool, status
 	}
 
 	if statusOK {
-		if cfg.includeVersion && status.Version != "" {
-			lines = append(lines, fmt.Sprintf("Version: <code>%s</code>", escapeHTML(status.Version)))
+		if status.kind != "" {
+			lines = append(lines, fmt.Sprintf("Type: <code>%s</code>", escapeHTML(status.kind)))
 		}
-		if cfg.includePlayers && status.Players.Max > 0 {
-			lines = append(lines, fmt.Sprintf("Players: <code>%d/%d</code>", status.Players.Online, status.Players.Max))
+		if cfg.includeVersion && status.version != "" {
+			lines = append(lines, fmt.Sprintf("Version: <code>%s</code>", escapeHTML(status.version)))
 		}
-		if cfg.includeMotd && len(status.Motd.Clean) > 0 {
-			motd := strings.Join(status.Motd.Clean, " | ")
-			lines = append(lines, fmt.Sprintf("MOTD: <i>%s</i>", escapeHTML(motd)))
+		if cfg.includeVersion && status.protocol != "" {
+			lines = append(lines, fmt.Sprintf("Protocol: <code>%s</code>", escapeHTML(status.protocol)))
+		}
+		if cfg.includePlayers && status.playersOnline != nil && status.playersMax != nil {
+			lines = append(lines, fmt.Sprintf("Players: <code>%d/%d</code>", *status.playersOnline, *status.playersMax))
+		}
+		if cfg.includePlayers && len(status.samplePlayers) > 0 {
+			lines = append(lines, fmt.Sprintf("Online: <code>%s</code>", escapeHTML(strings.Join(status.samplePlayers, ", "))))
+		}
+		if cfg.includeMotd && status.motd != "" {
+			lines = append(lines, fmt.Sprintf("MOTD: <i>%s</i>", escapeHTML(status.motd)))
+		}
+		if status.latency != nil {
+			lines = append(lines, fmt.Sprintf("Latency: <code>%s</code>", escapeHTML(status.latency.String())))
+		}
+		if status.modsCount != nil {
+			lines = append(lines, fmt.Sprintf("Mods: <code>%d</code>", *status.modsCount))
+		}
+		if status.gamemode != "" {
+			lines = append(lines, fmt.Sprintf("Gamemode: <code>%s</code>", escapeHTML(status.gamemode)))
+		}
+		if status.serverID != "" {
+			lines = append(lines, fmt.Sprintf("Server ID: <code>%s</code>", escapeHTML(status.serverID)))
 		}
 	}
 
