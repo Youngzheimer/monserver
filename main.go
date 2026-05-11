@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"mime/multipart"
@@ -21,26 +22,28 @@ import (
 )
 
 type config struct {
-	host              string
-	port              uint16
-	pollInterval      time.Duration
-	requestTimeout    time.Duration
-	runOnce           bool
-	notifyOnStart     bool
-	serverEdition     string
-	allowLegacyStatus bool
-	telegramToken     string
-	telegramChatID    string
-	telegramParseMode string
-	telegramUsePhoto  bool
-	disableWebPreview bool
-	includeMotd       bool
-	includePlayers    bool
-	includeVersion    bool
-	includeAddress    bool
-	messagePrefix     string
-	openText          string
-	closedText        string
+	host                  string
+	port                  uint16
+	pollInterval          time.Duration
+	requestTimeout        time.Duration
+	runOnce               bool
+	notifyOnStart         bool
+	serverEdition         string
+	allowLegacyStatus     bool
+	telegramToken         string
+	telegramChatID        string
+	telegramParseMode     string
+	telegramUsePhoto      bool
+	disableWebPreview     bool
+	telegramPollInterval  time.Duration
+	telegramUpdateTimeout time.Duration
+	includeMotd           bool
+	includePlayers        bool
+	includeVersion        bool
+	includeAddress        bool
+	messagePrefix         string
+	openText              string
+	closedText            string
 }
 
 type serverStatus struct {
@@ -68,6 +71,10 @@ func main() {
 
 	address := net.JoinHostPort(cfg.host, strconv.Itoa(int(cfg.port)))
 	log.Printf("monitoring %s", address)
+	if err := registerTelegramCommands(cfg); err != nil {
+		log.Printf("telegram command setup error: %v", err)
+	}
+	startTelegramCommandListener(cfg, address)
 
 	lastStatus := -1
 	for {
@@ -156,6 +163,18 @@ func loadConfig() (config, error) {
 	}
 	cfg.telegramUsePhoto = getEnvBool("TELEGRAM_USE_PHOTO", true)
 	cfg.disableWebPreview = getEnvBool("DISABLE_WEB_PREVIEW", true)
+
+	telegramPollSec := getEnvInt("TELEGRAM_POLL_INTERVAL_SEC", 2)
+	if telegramPollSec < 0 {
+		return cfg, fmt.Errorf("TELEGRAM_POLL_INTERVAL_SEC must be >= 0")
+	}
+	cfg.telegramPollInterval = time.Duration(telegramPollSec) * time.Second
+
+	telegramTimeoutSec := getEnvInt("TELEGRAM_UPDATE_TIMEOUT_SEC", 25)
+	if telegramTimeoutSec < 1 || telegramTimeoutSec > 50 {
+		return cfg, fmt.Errorf("TELEGRAM_UPDATE_TIMEOUT_SEC must be between 1 and 50")
+	}
+	cfg.telegramUpdateTimeout = time.Duration(telegramTimeoutSec) * time.Second
 
 	cfg.includeMotd = getEnvBool("INCLUDE_MOTD", true)
 	cfg.includePlayers = getEnvBool("INCLUDE_PLAYERS", true)
@@ -405,6 +424,189 @@ func sendTelegramPhoto(cfg config, caption string, photo []byte) error {
 		return fmt.Errorf("telegram status: %s", resp.Status)
 	}
 	return nil
+}
+
+type telegramUpdateResponse struct {
+	OK          bool             `json:"ok"`
+	Result      []telegramUpdate `json:"result"`
+	Description string           `json:"description"`
+	ErrorCode   int              `json:"error_code"`
+}
+
+type telegramUpdate struct {
+	UpdateID      int64            `json:"update_id"`
+	Message       *telegramMessage `json:"message"`
+	EditedMessage *telegramMessage `json:"edited_message"`
+}
+
+type telegramMessage struct {
+	MessageID int64        `json:"message_id"`
+	Chat      telegramChat `json:"chat"`
+	Text      string       `json:"text"`
+}
+
+type telegramChat struct {
+	ID   int64  `json:"id"`
+	Type string `json:"type"`
+}
+
+type telegramBotCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+func registerTelegramCommands(cfg config) error {
+	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/setMyCommands", cfg.telegramToken)
+	payload := struct {
+		Commands []telegramBotCommand `json:"commands"`
+	}{
+		Commands: []telegramBotCommand{{Command: "status", Description: "Get server status"}},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: cfg.requestTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("telegram status: %s", resp.Status)
+	}
+	return nil
+}
+
+func startTelegramCommandListener(cfg config, address string) {
+	go func() {
+		log.Printf("telegram command listener started")
+		var offset int64
+		for {
+			updates, err := fetchTelegramUpdates(cfg, offset)
+			if err != nil {
+				log.Printf("telegram updates error: %v", err)
+				if cfg.telegramPollInterval > 0 {
+					time.Sleep(cfg.telegramPollInterval)
+				}
+				continue
+			}
+			for _, update := range updates {
+				if update.UpdateID >= offset {
+					offset = update.UpdateID + 1
+				}
+				msg := update.Message
+				if msg == nil {
+					msg = update.EditedMessage
+				}
+				if msg == nil {
+					continue
+				}
+				if !isAuthorizedChat(cfg, msg.Chat.ID) {
+					continue
+				}
+				handleTelegramCommand(cfg, address, msg.Text)
+			}
+			if cfg.telegramPollInterval > 0 {
+				time.Sleep(cfg.telegramPollInterval)
+			}
+		}
+	}()
+}
+
+func fetchTelegramUpdates(cfg config, offset int64) ([]telegramUpdate, error) {
+	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates", cfg.telegramToken)
+	params := url.Values{}
+	params.Set("timeout", strconv.Itoa(int(cfg.telegramUpdateTimeout.Seconds())))
+	params.Set("limit", "100")
+	if offset > 0 {
+		params.Set("offset", strconv.FormatInt(offset, 10))
+	}
+
+	req, err := http.NewRequest("GET", endpoint+"?"+params.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{Timeout: cfg.telegramUpdateTimeout + cfg.requestTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("telegram status: %s", resp.Status)
+	}
+
+	var payload telegramUpdateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	if !payload.OK {
+		if payload.Description != "" {
+			return nil, fmt.Errorf("telegram api error: %s", payload.Description)
+		}
+		return nil, fmt.Errorf("telegram api error (code %d)", payload.ErrorCode)
+	}
+	return payload.Result, nil
+}
+
+func handleTelegramCommand(cfg config, address string, text string) {
+	command := normalizeCommand(text)
+	if command == "" {
+		return
+	}
+
+	switch command {
+	case "/status":
+		status, statusOK, statusErr := fetchMinecraftStatus(cfg)
+		if statusErr != nil {
+			log.Printf("status error: %v", statusErr)
+		}
+		message := buildMessage(cfg, address, statusOK, statusOK, status)
+		if err := sendTelegramNotification(cfg, message, statusOK, status); err != nil {
+			log.Printf("telegram error: %v", err)
+		}
+	default:
+		return
+	}
+}
+
+func normalizeCommand(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 {
+		return ""
+	}
+	command := fields[0]
+	if !strings.HasPrefix(command, "/") {
+		return ""
+	}
+	if strings.Contains(command, "@") {
+		command = strings.Split(command, "@")[0]
+	}
+	return strings.ToLower(command)
+}
+
+func isAuthorizedChat(cfg config, chatID int64) bool {
+	return strconv.FormatInt(chatID, 10) == cfg.telegramChatID
 }
 
 func decodeIcon(icon string) ([]byte, bool) {
